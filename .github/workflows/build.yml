@@ -1,0 +1,185 @@
+name: build
+
+on:
+  push:
+    branches:
+      - test
+      - source
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        persist-credentials: true
+    - name: install prerequisites
+      run: sudo apt-get update && sudo apt-get install -y shellcheck shfmt jq sqlite3 iucode-tool make
+    - name: update Intel model list
+      run: ./scripts/update_intel_models.sh
+    - name: build and check
+      run: |
+        make build fmt-check shellcheck
+        mv spectre-meltdown-checker.sh dist/
+    - name: check direct execution
+      run: |
+        set -x
+        expected=$(cat .github/workflows/expected_cve_count)
+        cd dist
+
+        json=$(sudo ./spectre-meltdown-checker.sh --batch json || true)
+
+        # Validate JSON is well-formed (and show it if not)
+        echo "$json" | jq . >/dev/null || {
+          echo "Invalid JSON produced by spectre-meltdown-checker.sh"
+          echo "$json"
+          exit 1
+        }
+
+        # Validate required keys exist
+        for key in meta system cpu cpu_microcode vulnerabilities; do
+          echo "$json" | jq -e ".$key" >/dev/null || {
+            echo "Missing top-level key: $key"
+            echo "$json" | jq .
+            exit 1
+          }
+        done
+
+        # Use -r to get raw scalars (no quotes)
+        fmtver=$(echo "$json" | jq -r '.meta.format_version // empty')
+        if [ "$fmtver" != "1" ]; then
+          echo "Unexpected format_version: $fmtver"
+          echo "$json" | jq .
+          exit 1
+        fi
+
+        run_as_root=$(echo "$json" | jq -r '.meta.run_as_root // empty')
+        if [ "$run_as_root" != "true" ]; then
+          echo "Expected run_as_root=true, got: $run_as_root"
+          echo "$json" | jq .
+          exit 1
+        fi
+
+        mocked=$(echo "$json" | jq -r '.meta.mocked // "false"')
+        if [ "$mocked" = "true" ]; then
+          echo "mocked=true must never appear in production"
+          echo "$json" | jq .
+          exit 1
+        fi
+
+        # Count CVEs robustly (as a number)
+        nb=$(echo "$json" | jq -r '[.vulnerabilities[].cve] | length')
+        if [ "$nb" -ne "$expected" ]; then
+          echo "Invalid number of CVEs reported: $nb instead of $expected"
+          echo "$json" | jq '.vulnerabilities[].cve'
+          exit 1
+        else
+          echo "OK $nb CVEs reported"
+        fi
+
+        # Validate json-terse backward compatibility
+        nb_terse=$(sudo ./spectre-meltdown-checker.sh --batch json-terse | jq -r 'map(.CVE) | length')
+        if [ "$nb_terse" -ne "$expected" ]; then
+          echo "json-terse backward compat broken: $nb_terse CVEs instead of $expected"
+          exit 1
+        else
+          echo "OK json-terse backward compat: $nb_terse CVEs"
+        fi
+    - name: check docker compose run execution
+      run: |
+        expected=$(cat .github/workflows/expected_cve_count)
+        cd dist
+        docker compose build
+        json=$(docker compose run --rm spectre-meltdown-checker --batch json || true)
+        echo "$json" | jq . > /dev/null
+        fmtver=$(echo "$json" | jq '.meta.format_version')
+        if [ "$fmtver" != "1" ]; then
+          echo "Unexpected format_version: $fmtver"
+          exit 1
+        fi
+        nb=$(echo "$json" | jq '.vulnerabilities[].cve' | wc -l)
+        if [ "$nb" -ne "$expected" ]; then
+          echo "Invalid number of CVEs reported: $nb instead of $expected"
+          exit 1
+        else
+          echo "OK $nb CVEs reported"
+        fi
+    - name: check docker run execution
+      run: |
+        expected=$(cat .github/workflows/expected_cve_count)
+        cd dist
+        docker build -t spectre-meltdown-checker .
+        json=$(docker run --rm --privileged -v /boot:/boot:ro -v /dev/cpu:/dev/cpu:ro -v /lib/modules:/lib/modules:ro spectre-meltdown-checker --batch json || true)
+        echo "$json" | jq . > /dev/null
+        fmtver=$(echo "$json" | jq '.meta.format_version')
+        if [ "$fmtver" != "1" ]; then
+          echo "Unexpected format_version: $fmtver"
+          exit 1
+        fi
+        nb=$(echo "$json" | jq '.vulnerabilities[].cve' | wc -l)
+        if [ "$nb" -ne "$expected" ]; then
+          echo "Invalid number of CVEs reported: $nb instead of $expected"
+          exit 1
+        else
+          echo "OK $nb CVEs reported"
+        fi
+    - name: check fwdb update (separated)
+      run: |
+        cd dist
+        nbtmp1=$(find /tmp 2>/dev/null | wc -l)
+        ./spectre-meltdown-checker.sh --update-fwdb; ret=$?
+        if [ "$ret" != 0 ]; then
+          echo "Non-zero return value: $ret"
+          exit 1
+        fi
+        nbtmp2=$(find /tmp 2>/dev/null | wc -l)
+        if [ "$nbtmp1" != "$nbtmp2" ]; then
+          echo "Left temporary files!"
+          exit 1
+        fi
+        if ! [ -e ~/.mcedb ]; then
+          echo "No .mcedb file found after updating fwdb"
+          exit 1
+        fi
+    - name: check fwdb update (builtin)
+      run: |
+        cd dist
+        nbtmp1=$(find /tmp 2>/dev/null | wc -l)
+        ./spectre-meltdown-checker.sh --update-builtin-fwdb; ret=$?
+        if [ "$ret" != 0 ]; then
+          echo "Non-zero return value: $ret"
+          exit 1
+        fi
+        nbtmp2=$(find /tmp 2>/dev/null | wc -l)
+        if [ "$nbtmp1" != "$nbtmp2" ]; then
+          echo "Left temporary files!"
+          exit 1
+        fi
+    - name: create a pull request to ${{ github.ref_name }}-build
+      run: |
+        # all the files in dist/* and .github/* must be moved as is to the -build branch root, move them out for now:
+        tmpdir=$(mktemp -d)
+        mv ./dist/* .github $tmpdir/
+        rm -rf ./dist
+
+        git fetch origin ${{ github.ref_name }}-build
+        git checkout -f ${{ github.ref_name }}-build
+        rm -rf doc/
+        mv $tmpdir/* .
+        rm -rf src/ scripts/ img/
+        mkdir -p .github
+        rsync -vaP --delete $tmpdir/.github/ .github/
+
+        git add --all
+        echo =#=#= DIFF CACHED
+        git diff --cached
+        echo =#=#= STATUS
+        git status
+        echo =#=#= COMMIT
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git log ${{ github.ref }} -1 --format=format:'%s%n%n built from commit %H%n dated %ai%n by %an (%ae)%n%n %b'
+        git log ${{ github.ref }} -1 --format=format:'%s%n%n built from commit %H%n dated %ai%n by %an (%ae)%n%n %b' | git commit -F -
+        git push
